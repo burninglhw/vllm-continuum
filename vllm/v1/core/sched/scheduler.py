@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
+# 中文导读：Continuum 的执行层，决定每轮算谁、算多少 token、保护/释放谁的 KV。
+# 它不做神经网络前向；EngineCore.step() 把 schedule() 的结果交给 GPU executor。
+# 主线：add_request → schedule → update_from_output → _free_request/_free_blocks。
+# 策略数学在 continuum_policy.py；工具/历史在 estimate_with_func.py。
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.core.estimate_with_func import ToolCallEstimator, Continuum_Recorder
+from vllm.v1.core.continuum_policy import program_key
 
 logger = init_logger(__name__)
 
@@ -127,18 +132,13 @@ class Scheduler(SchedulerInterface):
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
 
-        # Initialize ToolCallEstimator with tokenizer config
-        self.tool_call_estimator = ToolCallEstimator(
-            model_name=vllm_config.model_config.tokenizer,
-            tokenizer_mode=vllm_config.model_config.tokenizer_mode,
-            trust_remote_code=vllm_config.model_config.trust_remote_code,
-            tokenizer_revision=vllm_config.model_config.tokenizer_revision,
-        )
-
-        # TODO(Hanchen) This stored the list of pineed requests and the time they need to be removed
+        # Do not tokenize, estimate tools or impose program semantics on FCFS.
+        self.tool_call_estimator = (
+            # FCFS 仍复用 vLLM 的基础设施，但不构造 Continuum 估计器。
+            ToolCallEstimator.from_config(vllm_config, self.continuum_recorder)
+            if self.policy == SchedulingPolicy.CONTINUUM else None)
         self.pinned_requests: list[Tuple[Request, float]] = []
-        # Track the first entry time for each job_id in running queue (for job_id level FCFS)
-        self.running_job_id_first_entry_time: dict[str] = {}
+        self.running_job_id_first_entry_time: dict[tuple, float] = {}
         # Track prefill start time for throughput measurement
         self.request_prefill_start_time: dict[str, float] = {}
         # The request IDs that are finished in between the previous and the
@@ -192,76 +192,57 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
-    def pop_running_request_based_on_last_step(self, request: Request) -> tuple[Request, bool]:
-        """Pop a request from running queue based on job_id level FCFS and last step."""
-        if len(self.running) <= 1:
-            #wpop from pinned requests from smallest end_time
-            latest_pin_end_request = None
-            latest_pin_end_time = -float('inf')
-            for req, end_time in self.pinned_requests:
-                if end_time > latest_pin_end_time:
-                    latest_pin_end_time = end_time
-                    latest_pin_end_request = req
-            if latest_pin_end_request is not None:
-                self.pinned_requests.remove((latest_pin_end_request, latest_pin_end_time))
-                return latest_pin_end_request, True
+    def _unpin_latest_program(self) -> bool:
+        # 整体回收“程序首次到达最晚”的 pin，不是 TTL 到期最晚的 pin；
+        # 也不是 Elastic 的按块截短前缀。成功一次只释放一个 owner。
+        if not self.pinned_requests:
+            return False
+        request, deadline = max(
+            self.pinned_requests,
+            key=lambda pair: self.running_job_id_first_entry_time.get(
+                program_key(pair[0]), pair[0].arrival_time))
+        self.unpin_request(request, deadline)
+        return True
 
-            raise IndexError("pop from empty running queue")
-                
-        # First, find the request that is not last step
-        latest_request = None
-        latest_entry_time = -float('inf')
-        
-        for req in self.running:
-            job_entry_time = self.running_job_id_first_entry_time.get(req.job_id)
-            if job_entry_time > latest_entry_time and not req.is_last_step:
-                latest_entry_time = job_entry_time
-                latest_request = req
-        
-        if latest_request is not None:
-            self.running.remove(latest_request)
-            return latest_request, False
-
-        # Second, check the other requests
-        for req in self.running:
-            job_entry_time = self.running_job_id_first_entry_time.get(req.job_id)
-            if job_entry_time > latest_entry_time:
-                latest_entry_time = job_entry_time
-                latest_request = req
-        
-        if latest_request is not None:
-            self.running.remove(latest_request)
-            return latest_request, False
-    
-    # TODO (Hanchen) needs to get current time, add with length of pin to put end time of pin
     def pin_request(self, request: Request, length_of_pin: float) -> None:
+        # 一轮完成后暂不 free KV，保留它的引用，等待工具执行期间下轮回来。
+        # Preserve the actual completion-time deadline across delayed KV frees.
+        if request.continuum_pin_deadline <= 0:
+            request.continuum_pin_deadline = time.time() + length_of_pin
         self.continuum_recorder.request_pinned(request)
-        self.pinned_requests.append((request, time.time() + length_of_pin))
+        self.pinned_requests.append((request, request.continuum_pin_deadline))
 
-    def unpin_request(self, request: Request, end_time: float) -> None:
+    def unpin_request(self, request: Request, end_time: float,
+                      evicted: bool = True) -> None:
+        # unpin 减少引用，使块可被回收；不主动删除仍可命中的 APC 哈希缓存。
         self.pinned_requests.remove((request, end_time))
         self.continuum_recorder.request_unpinned(request)
         self.kv_cache_manager.free(request)
+        if evicted and self.tool_call_estimator is not None:
+            self.tool_call_estimator.mark_evicted(request)
 
-    # TODO (Hanchen) this needs to be called at the beginning of each step to clean up pinned request based on system time
-    # The LRU is handled by kv cache mangager through a reference counter
+    def _release_program_pins(self, request: Request) -> None:
+        # 返回请求已经取得自身引用后，才释放同程序上一轮的 owner 引用。
+        for previous, deadline in list(self.pinned_requests):
+            if program_key(previous) == program_key(request):
+                self.unpin_request(previous, deadline, evicted=False)
+
     def unpin_requests_regular(self) -> None:
-        # Check if job id "1" is in waiting requests
-        waiting_job_ids = [req.job_id for req in self.waiting]
-
-        for request, end_time in self.pinned_requests:
-            #print("time.time() - end_time:", time.time() - end_time)
-            if request.job_id not in waiting_job_ids and time.time() >= end_time:
-                #print(f"Unpinning request {request.request_id} with job id {request.job_id}")
-                self.unpin_request(request, end_time)
+        # 正在 waiting 队列中的返回程序即使 TTL 到期，也先等其取得缓存引用。
+        waiting = {program_key(request) for request in self.waiting}
+        now = time.time()
+        # Iterate a snapshot: consecutive expired entries must all be freed.
+        for request, deadline in list(self.pinned_requests):
+            if program_key(request) not in waiting and now > deadline:
+                self.unpin_request(request, deadline)
 
     def is_pinned(self, request: Request) -> bool:
-        for req, _ in self.pinned_requests:
-            if req.job_id == request.job_id:
-                return True
-        return False
-    
+        return any(program_key(req) == program_key(request)
+                   for req, _ in self.pinned_requests)
+
     def schedule(self) -> SchedulerOutput:
+        # 每个调度 tick：①清过期保护 ②推进 running ③接纳 waiting ④打包计划。
+        # num_computed_tokens 表示已算 token 数；budget 是本 tick 可调度 token 数。
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -357,54 +338,59 @@ class Scheduler(SchedulerInterface):
                     logger.debug(f"New blocks is None")
                 
                 if new_blocks is None:
-                    # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
-                    is_unpin = False
+                    # 运行中显存不够：新版先 unpin，再考虑抢占 running。
+                    # 这是实际策略选择，区别于旧框架“多 running 时优先抢占”。
+                    # Whole-request unpinning first under memory pressure.
+                    # Never use client future/last-step metadata for priority.
+                    if (self.policy == SchedulingPolicy.CONTINUUM
+                            and self._unpin_latest_program()):
+                        continue
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        self.running.remove(preempted_req)
-                        self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
-                        if preempted_req in scheduled_running_reqs:
-                            scheduled_running_reqs.remove(preempted_req)
-
-                    # TODO (Hanchen) need to implement CONTINUUM preemption, find the request that is not pinned something is pinned, do not preempt
+                            key=lambda r: (r.priority, r.arrival_time))
                     elif self.policy == SchedulingPolicy.CONTINUUM:
-                        #NOTE (Hanchen) we need to not evict last step requests
-                        preempted_req, is_unpin = self.pop_running_request_based_on_last_step(request)
-                        
-                        #TODO (Hanchen) we need to add a check unpin requests with the same job id.
-                        if preempted_req in scheduled_running_reqs:
-                            scheduled_running_reqs.remove(preempted_req)
-                    
-                        if preempted_req.request_id in num_scheduled_tokens:
-                            del num_scheduled_tokens[preempted_req.request_id]
-                        if preempted_req.request_id in req_to_new_blocks:
-                            del req_to_new_blocks[preempted_req.request_id]
-                        self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: self.running_job_id_first_entry_time[
+                                program_key(r)])
                     else:
-                        preempted_req = self.running.pop()
-                        self.continuum_recorder.request_evicted_from_running_queue(preempted_req)
+                        preempted_req = self.running[-1]
 
+                    victim_index = self.running.index(preempted_req)
+                    self.running.remove(preempted_req)
+                    if victim_index < req_index:
+                        req_index -= 1
+                    if preempted_req in scheduled_running_reqs:
+                        scheduled_running_reqs.remove(preempted_req)
+                    victim_id = preempted_req.request_id
+                    # victim 可能已被加入本 tick 计划：必须把它的预算和映射一起
+                    # 撤回，不能只从 running 删除，否则 GPU 计划与队列状态不一致。
+                    token_budget += num_scheduled_tokens.pop(victim_id, 0)
+                    req_to_new_blocks.pop(victim_id, None)
+                    scheduled_spec_decode_tokens.pop(victim_id, None)
+                    for input_id in scheduled_encoder_inputs.pop(victim_id, []):
+                        encoder_compute_budget += (
+                            preempted_req.get_num_encoder_tokens(input_id))
+                        new_encoder_compute_budget += (
+                            preempted_req.get_num_encoder_tokens(input_id))
+                    self.continuum_recorder.request_evicted_from_running_queue(
+                        preempted_req)
+                    if self.tool_call_estimator is not None:
+                        self.tool_call_estimator.mark_evicted(
+                            preempted_req, running=True)
                     self.kv_cache_manager.free(preempted_req)
                     self.encoder_cache_manager.free(preempted_req)
-                    if is_unpin:
-                        pass
-                    else:
-                        preempted_req.status = RequestStatus.PREEMPTED
-                        preempted_req.num_computed_tokens = 0
-                        if self.log_stats:
-                            preempted_req.record_event(
-                                EngineCoreEventType.PREEMPTED, scheduled_timestamp)
-
-                        self.waiting.prepend_request(preempted_req)
-                        preempted_reqs.append(preempted_req)
-                        if preempted_req == request:
-                            # No more request to preempt.
-                            can_schedule = False
-                            break
+                    preempted_req.status = RequestStatus.PREEMPTED
+                    preempted_req.num_computed_tokens = 0
+                    if self.log_stats:
+                        preempted_req.record_event(
+                            EngineCoreEventType.PREEMPTED, scheduled_timestamp)
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        can_schedule = False
+                        break
                 else:
                     # The request can be scheduled.
                     can_schedule = True
@@ -460,16 +446,10 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
                 
-                # TODO (Hanchen) this is currently peeking FCFS or priority, we can change this to something else.
-                if self.policy == SchedulingPolicy.FCFS:
-                    request = self.waiting.peek_request()
-                elif self.policy == SchedulingPolicy.PRIORITY:
-                    request = self.waiting.peek_request()
-                elif self.policy == SchedulingPolicy.CONTINUUM:
-                    #The current implementation is basically giving priority to jobs with less prefill tokens.
-                    request = self.waiting.peek_request(self.pinned_requests, self.kv_cache_manager, self.connector)
+                if self.policy == SchedulingPolicy.CONTINUUM:
+                    request = self.waiting.peek_request(self.pinned_requests)
                 else:
-                    raise ValueError(f"Invalid policy: {self.policy}")
+                    request = self.waiting.peek_request()
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -480,10 +460,7 @@ class Scheduler(SchedulerInterface):
                         logger.debug(
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request.request_id)
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
-                        else:
-                            self.waiting.pop_request()
+                        self.waiting.remove_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -494,10 +471,7 @@ class Scheduler(SchedulerInterface):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        if self.policy == SchedulingPolicy.CONTINUUM: 
-                            self.waiting.pop_request(self.pinned_requests, self.kv_cache_manager, self.connector)
-                        else:
-                            self.waiting.pop_request()
+                        self.waiting.remove_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -507,7 +481,7 @@ class Scheduler(SchedulerInterface):
                     (len(scheduled_loras) == self.lora_config.max_loras and
                      request.lora_request.lora_int_id not in scheduled_loras)):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.pop_request()
+                    self.waiting.remove_request(request)
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
@@ -535,7 +509,7 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
-                            self.waiting.pop_request()
+                            self.waiting.remove_request(request)
                             skipped_waiting_requests.prepend_request(request)
                             continue
 
@@ -572,7 +546,7 @@ class Scheduler(SchedulerInterface):
                     # pooling requests to be chunked
                     if not self.scheduler_config.chunked_prefill_enabled and \
                         num_new_tokens > token_budget:
-                        self.waiting.pop_request()
+                        self.waiting.remove_request(request)
                         skipped_waiting_requests.prepend_request(request)
                         continue
 
@@ -627,16 +601,13 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
-                    #print(f"Request {request.request_id} cannot be scheduled due to no slots")
-                    # The request cannot be scheduled.
-                    # TODO (Hanchen) need to add preemption logic here for CONTINUUM
-                    if len(self.running) == 0 and self.pinned_requests:
-                        if self.policy == SchedulingPolicy.CONTINUUM:
-                            preempted_req, _ = self.pop_running_request_based_on_last_step(request)
-                            if preempted_req in scheduled_running_reqs:
-                                scheduled_running_reqs.remove(preempted_req)
-                            self.kv_cache_manager.free(preempted_req)
-                            self.encoder_cache_manager.free(preempted_req)
+                    if (self.policy == SchedulingPolicy.CONTINUUM
+                            and not num_scheduled_tokens
+                            and self._unpin_latest_program()):
+                        # Retry from cache lookup, not with stale block handles.
+                        # Each retry removes a pin, so this loop is bounded.
+                        # 必须重新做缓存查找；释放 owner 后旧 block 句柄可能失效。
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -654,6 +625,10 @@ class Scheduler(SchedulerInterface):
                 # unless it was re-added above due to new_blocks being None.
 
                 self.waiting.remove_request(request)
+                # allocate_slots has now acquired references to prefix hits.
+                # Only now may the old request's ownership be released.
+                if self.policy == SchedulingPolicy.CONTINUUM:
+                    self._release_program_pins(request)
 
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -662,6 +637,8 @@ class Scheduler(SchedulerInterface):
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     continue
 
+                if self.tool_call_estimator is not None:
+                    self.tool_call_estimator.request_scheduled(request)
                 req_index += 1
                 self.running.append(request)
                 if self.log_stats:
@@ -726,7 +703,9 @@ class Scheduler(SchedulerInterface):
         # This can be potentially used for cascade attention.
         num_common_prefix_blocks = [0] * len(
             self.kv_cache_config.kv_cache_groups)
-        if self.running:
+        # Pinned/delayed-free owners invalidate the refcount==batch-size
+        # assumption used by cascade attention. Use ordinary attention.
+        if self.running and self.policy != SchedulingPolicy.CONTINUUM:
             any_request = self.running[0]
             num_common_prefix_blocks = (
                 self.kv_cache_manager.get_num_common_prefix_blocks(
@@ -1267,16 +1246,12 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
-        self.tool_call_estimator.request_arrives(request)
+        # 服务入口：先让估计器识别同程序返回，再放入等待队列；此时不执行 GPU。
+        if self.tool_call_estimator is not None:
+            self.tool_call_estimator.request_arrives(request)
         self.continuum_recorder.request_arrives(request)
-
-        #print(f"Adding request {request.job_id} to waiting queue")
-        #print(f"Request last_func_call: {request.last_func_call}")
-        #print(f"Request is_last_step: {request.is_last_step}")
-        #print(f"Request this_func_call: {request.this_func_call}")
-        # Track the first entry time for this job_id if not already recorded
-        if request.job_id not in self.running_job_id_first_entry_time:
-            self.running_job_id_first_entry_time[request.job_id] = request.arrival_time
+        self.running_job_id_first_entry_time.setdefault(
+            program_key(request), request.arrival_time)
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
@@ -1305,8 +1280,9 @@ class Scheduler(SchedulerInterface):
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
             request = self.requests.get(req_id)
-            if request is None:
-                # Invalid request ID.
+            if request is None or request.is_finished():
+                # Invalid ID or an already-completed request retained only
+                # until its asynchronous KV transfer finishes.
                 continue
 
             valid_requests.append(request)
@@ -1327,8 +1303,15 @@ class Scheduler(SchedulerInterface):
             self._free_request(request)
 
     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
+        # 一轮结束：估计器决定“终止程序”还是“等待工具”，再走缓存释放/保留。
+        # 程序真正结束才清理程序级首次到达时间，避免长时间服务残留旧优先级。
         assert request.is_finished()
-        self.tool_call_estimator.request_finished(request)
+        if self.tool_call_estimator is not None:
+            self.tool_call_estimator.request_finished(request)
+            self._release_program_pins(request)
+            if request.continuum_program_finished:
+                self.waiting.forget_program(request)
+                self.running_job_id_first_entry_time.pop(program_key(request), None)
         self.continuum_recorder.request_finished(request)
 
         # NOTE (Hanchen) in unpin, we need to make sure it is not delay free blocks because it could be still waiting for transfer, need to copy something similar to the kv_xfer_params
@@ -1347,25 +1330,16 @@ class Scheduler(SchedulerInterface):
         return kv_xfer_params
 
     def _free_blocks(self, request: Request):
+        # TTL 剩余为正就暂留整轮 KV；否则调用 vLLM 的 free，允许块被后续复用。
         assert request.is_finished()
-        #NOTE (Hanchen) this is called when the request is finished
-        for req, end_time in self.pinned_requests:
-            if req.job_id == request.job_id:
-                self.unpin_request(req, end_time)
-        
-        # TODO (Hanchen) check if we want to pin this memory here for how long, pin them on scheduler level.
-        #############
-        if self.policy == SchedulingPolicy.CONTINUUM and not request.is_last_step:
+        if self.tool_call_estimator is not None:
             length_of_pin = self.tool_call_estimator.set_up_pin(request)
-
-            #print(f"Setting up pin for request {request.request_id} with length {length_of_pin}")
-            #Floating point error
-            if length_of_pin > 0.01:
+            if length_of_pin > 0:
                 self.pin_request(request, length_of_pin)
                 del self.requests[request.request_id]
                 return
-        #############
-
+            if self.tool_call_estimator.is_pending(request):
+                self.tool_call_estimator.mark_evicted(request)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 

@@ -248,6 +248,7 @@ class EngineCore:
             logger.warning("Got kv_transfer_params, but no KVConnector found. "
                            "Disabling KVTransfer for this request.")
 
+        # 中文调用链：HTTP/离线输入转换成 Request 后，在这里进入同一个 Scheduler。
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -288,10 +289,13 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # 中文调用链：1. CPU 调度器决定本 tick 的请求/token/block 计划。
         scheduler_output = self.scheduler.schedule()
+        # 2. executor → worker → GPUModelRunner，执行真正的模型前向与采样。
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore
             scheduler_output)
+        # 3. 回写新 token，判断结束；完成请求进入 Continuum 的解析/TTL/pin 流程。
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output)  # type: ignore
 

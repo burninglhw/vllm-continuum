@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# 中文导读：Request 是“一轮模型请求”的状态对象，不是整个多轮 agent 程序。
+# job_id 跨轮不变，request_id 每轮不同；KV 和调度 token 进度通常按 request_id 管。
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
@@ -51,6 +53,11 @@ class Request:
         self.last_func_call = last_func_call
         self.is_last_step = is_last_step
         self.this_func_call = this_func_call
+        # Server-derived lifecycle state, never client-provided future data.
+        self.continuum_pin_deadline = 0.0
+        # 服务端计算的绝对到期时刻；客户端不能直接指定未来 TTL。
+        self.continuum_program_finished = False
+        # 与 request.status 区分：一轮输出工具调用后请求已结束，但程序还没结束。
         
         
         self.request_id = request_id  
@@ -98,6 +105,8 @@ class Request:
         self.num_output_placeholders = 0  # Used in async scheduling.
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        # prompt_token_ids 是这一轮的完整上下文（通常含历史），而非仅新增问题。
+        # APC 命中会减少实际重算；num_computed_tokens 追踪引擎已推进的位置。
         self.cache_salt: Optional[str] = cache_salt
 
         # Multi-modal related
@@ -138,6 +147,8 @@ class Request:
         block_hasher: Optional[Callable[["Request"], list["BlockHash"]]]
     ) -> "Request":
         # Extract optional job/function-call metadata from sampling_params.extra_args
+        # HTTP/离线入口最终都要转成 Request。原有兼容字段继续保留；新版估计器
+        # 主要自己解析输出，is_last_step 只在本轮完成后用于终止判断，不用于排序。
         job_id = None
         last_func_call = None
         is_last_step = None

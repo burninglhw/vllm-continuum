@@ -1,5 +1,8 @@
 import logging
+# 中文导读：这是 agent 到 vLLM HTTP 服务的客户端适配器，不是 GPU 调度器。
+# agent 在本地/容器执行工具，拼好下一轮 messages，再通过同一个 program_id 请求。
 import os
+import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
@@ -56,6 +59,11 @@ class VllmModel:
         self.config = config_class(**kwargs)
         self.cost = 0.0  # vLLM doesn't have cost, set to 0
         self.n_calls = 0
+        # One model instance represents one sequential agent program. A new
+        # per-turn ID would prevent Continuum from recognizing tool returns.
+        self.program_id = (str(self.config.job_id) if self.config.job_id > 0
+                           else uuid.uuid4().hex)
+        # UUID 只在实例初始化时生成一次；若每轮生成新 ID，服务端无法识别返回。
 
         # Initialize OpenAI client pointing to vLLM server
         self.client = OpenAI(
@@ -127,10 +135,10 @@ class VllmModel:
                 is_last_step = (self.n_calls + 1) >= self.config.step_limit
 
             # Prepare extra_body with Continuum-specific parameters
-            job_id_value = self.config.job_id if self.config.job_id > 0 else self.n_calls + 1
+            # 模型仍正常生成到 EOS；job_id 把多轮串起来，不发送未来工具耗时。
             extra_body = {
                 "ignore_eos": False,
-                "job_id": str(job_id_value),
+                "job_id": self.program_id,
                 "is_last_step": is_last_step
             }
 

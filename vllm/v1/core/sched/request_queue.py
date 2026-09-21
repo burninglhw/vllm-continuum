@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# 中文导读：这里只负责排队次序，不计算 TTL、不分配显存。
+# v6 §4.3：被抢占请求优先 → 其余请求按 pin 分组 → 组内按程序级 FCFS。
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
@@ -8,12 +10,8 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
 from enum import Enum
-from typing import Tuple
-
-from vllm.v1.request import Request
-from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
-import time
+from vllm.v1.request import Request, RequestStatus
+from vllm.v1.core.continuum_policy import program_key
 
 class SchedulingPolicy(Enum):
     """Enum for scheduling policies."""
@@ -216,126 +214,73 @@ class PriorityRequestQueue(RequestQueue):
         """Iterate over the queue in reverse priority order."""
         return reversed(list(self))
 
-# TODO (Hanchen) need to implement ContinuumRequestQueue that schedules requests based on the last func call, it can call another predictor class if needed
 class ContinuumRequestQueue(deque[Request], RequestQueue):
-    
+    """arXiv v6 §4.3: preempted, then pinned, then program-level FCFS."""
+
     def __init__(self) -> None:
         super().__init__()
-        # Track the first entry time for each job_id
-        self.job_id_first_entry_time: dict[str, float] = {}
-   
+        self.job_id_first_entry_time = {}
+
+    def _remember(self, request):
+        # 同一多轮程序记住最初到达时间，不能每轮返回都重新排到队尾。
+        self.job_id_first_entry_time.setdefault(program_key(request),
+                                                request.arrival_time)
+
+    def forget_program(self, request):
+        # 程序结束后清理；以后即便客户端复用 ID，也不应继承旧程序的优先级。
+        self.job_id_first_entry_time.pop(program_key(request), None)
+
     def add_request(self, request: Request) -> None:
-        """Add a request to the queue according to FCFS policy."""
-        # Record the first entry time for this job_id if not already recorded
-        if request.job_id not in self.job_id_first_entry_time:
-            self.job_id_first_entry_time[request.job_id] = request.arrival_time
+        self._remember(request)
         self.append(request)
 
-    def pop_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1) -> Request:
-        """Pop a request from the queue according to continuum policy."""
-        request = self.peek_request(pinned_requests, kv_cache_manager, connector)
-        self.remove_request(request)
-        return request
-
-    # NOTE (Hanchen): priority is pinned request -> job_id level FCFS
-    def peek_request(self, pinned_requests: list[Tuple[Request, float]], kv_cache_manager: KVCacheManager, connector: KVConnectorBase_V1) -> Request:
+    def peek_request(self, pinned_requests=(), kv_cache_manager=None,
+                     connector=None) -> Request:
         if not self:
             raise IndexError("peek from an empty queue")
-        # Extract just the requests from pinned_requests tuples
-        pinned_request_job_id_set = {req.job_id for req, _ in pinned_requests}
+        pinned = {program_key(req) for req, _ in pinned_requests}
+        # 先恢复因 running 争用而抢占的请求。TTL 仅区分非抢占请求；每组内
+        # 按程序最初到达排序。request.arrival_time 只是相同程序时间的平局规则。
+        return min(self, key=lambda req: (
+            0 if req.status == RequestStatus.PREEMPTED else
+            1 if program_key(req) in pinned else 2,
+            self.job_id_first_entry_time.get(program_key(req), req.arrival_time),
+            req.arrival_time))
 
-        # First, use the pinned request
-        earliest_request = None
-        earliest_entry_time = float('inf')
-        for request in self:
-            if request.job_id in pinned_request_job_id_set:
-                job_entry_time = self.job_id_first_entry_time.get(request.job_id, request.arrival_time)
-                if job_entry_time < earliest_entry_time:
-                    earliest_entry_time = job_entry_time
-                    earliest_request = request
-        
-        if earliest_request is not None:
-            return earliest_request
-        
-        # Otherwise, use job_id level FCFS: find the request whose job_id has the earliest first entry time
-        if self:
-            earliest_request = None
-            earliest_entry_time = float('inf')
-            
-            for request in self:
-                job_entry_time = self.job_id_first_entry_time.get(request.job_id, request.arrival_time)
-                if job_entry_time < earliest_entry_time:
-                    earliest_entry_time = job_entry_time
-                    earliest_request = request
-            
-            return earliest_request
-        else:
-            raise IndexError("peek from an empty queue")
-
-  #  The blow implementation prioritize pineed request 
-    # def peek_request(self, pinned_requests: list[Tuple[Request, float]]) -> Request:
-    #     """Peek at the next request in the queue without removing it."""
-    #     if not self:
-    #         raise IndexError("peek from an empty queue")
-    #     # Extract just the requests from pinned_requests tuples
-    #     pinned_request_job_id_set = {req.job_id for req, _ in pinned_requests}
-        
-    #     # First, check if any of the requests in the queue are pinned
-    #     for request in self:
-    #         if request.job_id in pinned_request_job_id_set:
-    #             print(f"Pinned request found for job: {request.job_id}")
-    #             return request
-        
-    #     # If no pinned requests found, return the head of the queue
-    #     if self:
-    #         return self[0]
-
+    def pop_request(self, pinned_requests=(), kv_cache_manager=None,
+                    connector=None) -> Request:
+        request = self.peek_request(pinned_requests)
+        self.remove(request)
+        return request
 
     def prepend_request(self, request: Request) -> None:
-        """Prepend a request to the front of the queue."""
-        # Record the first entry time for this job_id if not already recorded
-        if request.job_id not in self.job_id_first_entry_time:
-            self.job_id_first_entry_time[request.job_id] = request.arrival_time
+        self._remember(request)
         self.appendleft(request)
 
     def prepend_requests(self, requests: RequestQueue) -> None:
-        """Prepend all requests from another queue to the front of this
-        queue."""
-        # Record first entry times for new job_ids
         for request in requests:
-            if request.job_id not in self.job_id_first_entry_time:
-                self.job_id_first_entry_time[request.job_id] = request.arrival_time
+            self._remember(request)
         self.extendleft(reversed(requests))
 
     def remove_request(self, request: Request) -> None:
-        """Remove a specific request from the queue."""
         self.remove(request)
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
-        """Remove multiple specific requests from the queue."""
-        requests_to_remove = set(requests)
-        filtered_requests = [
-            req for req in self if req not in requests_to_remove
-        ]
-        # deque does not support in-place filtering, so we need to clear
-        # and extend
+        removed = set(requests)
+        remaining = [request for request in self if request not in removed]
         self.clear()
-        self.extend(filtered_requests)
+        self.extend(remaining)
 
     def __bool__(self) -> bool:
-        """Check if queue has any requests."""
         return len(self) > 0
 
     def __len__(self) -> int:
-        """Get number of requests in queue."""
         return super().__len__()
 
     def __iter__(self) -> Iterator[Request]:
-        """Iterate over the queue according to FCFS policy."""
         return super().__iter__()
 
     def __reversed__(self) -> Iterator[Request]:
-        """Iterate over the queue in reverse order."""
         return super().__reversed__()
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:

@@ -152,6 +152,8 @@ class KVCacheManager:
 
     def get_computed_blocks(self,
                             request: Request) -> tuple[KVCacheBlocks, int]:
+        # 中文导读：按完整 token 前缀的 block hash 查 APC 命中，返回可少算的块。
+        # “有 pin”保证 owner 引用仍在，但实际命中仍由 token 前缀一致性决定。
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -304,6 +306,8 @@ class KVCacheManager:
         return KVCacheBlocks(new_blocks)
 
     def free(self, request: Request) -> None:
+        # 中文导读：释放这个 request 的块引用；共享块仍可能有其他 owner。
+        # 开启 APC 时，可回收块的内容/hash 可暂存到被覆盖，所以 free != 立即清空。
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
         first when caching is enabled.
