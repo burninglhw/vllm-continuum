@@ -188,6 +188,10 @@ AGENTS.md
 # DS Store
 .DS_Store
 
+# macOS AppleDouble metadata
+._*
+**/._*
+
 # Results
 *.csv
 
